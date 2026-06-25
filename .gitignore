@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Env
+.env
+*.key
+*.pem
+
+# Data
+data/
+datasets/
+Tvqa_data/
+LongTVQA/
+LongTVQA+/
+*.tar
+*.tar.gz
+*.zip
+*.mp4
+*.avi
+*.mkv
+
+# Model weights
+checkpoints/
+ckpts/
+weights/
+models/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Logs / outputs
+logs/
+runs/
+outputs/
+results/
+wandb/
+.cache/
+tmp/
+temp/
+
+# IDE
+.vscode/
+.idea/
