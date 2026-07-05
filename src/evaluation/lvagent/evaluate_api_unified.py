@@ -18,6 +18,37 @@ from typing import Any, Dict, List, Tuple
 from openai import OpenAI
 from PIL import Image
 
+try:
+    from clip_refiner import (
+        apply_refinement_to_decision,
+        plan_clip_refinement,
+        use_clip_refiner,
+    )
+    from memory import VideoMemory
+    from verifier import (
+        VerifierAgent,
+        build_verifier_feedback,
+        format_options,
+        format_recent_evidence,
+        use_verifier,
+        verifier_max_rounds,
+    )
+except ImportError:
+    from .clip_refiner import (
+        apply_refinement_to_decision,
+        plan_clip_refinement,
+        use_clip_refiner,
+    )
+    from .memory import VideoMemory
+    from .verifier import (
+        VerifierAgent,
+        build_verifier_feedback,
+        format_options,
+        format_recent_evidence,
+        use_verifier,
+        verifier_max_rounds,
+    )
+
 grounding_client = None
 vision_client = None
 main_client = None
@@ -48,6 +79,17 @@ class EvalConfig:
 
 
 config: EvalConfig | None = None
+
+
+def use_video_memory() -> bool:
+    value = os.getenv("USE_VIDEO_MEMORY", "0").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
+
+
+def estimate_text_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
 
 
 DATASET_DEFAULTS: Dict[str, Dict[str, str | None]] = {
@@ -291,6 +333,38 @@ def convert_image_to_base64_data_url(path: str) -> str | None:
         return None
 
 
+def adjacent_clip_ids(base_frame_dir: str, vid: str, direction: str, limit: int) -> List[str]:
+    match = re.fullmatch(r"(.*_clip_)(\d+)", vid)
+    if not match or limit <= 0:
+        return []
+    prefix, raw_idx = match.groups()
+    current_idx = int(raw_idx)
+    width = len(raw_idx)
+    offsets = {
+        "previous": [-1, -2],
+        "next": [1, 2],
+        "both": [-1, 1, -2, 2],
+    }.get(direction, [-1, 1])
+    result: List[str] = []
+    for offset in offsets:
+        candidate = f"{prefix}{current_idx + offset:0{width}d}"
+        if current_idx + offset >= 0 and Path(base_frame_dir, candidate).is_dir():
+            result.append(candidate)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def sample_fixed_frames(frame_budget: int) -> List[int]:
+    if frame_budget == 15:
+        return list(range(1, 181, 12))
+    if frame_budget < 15:
+        step = max(1, 180 // max(frame_budget, 1))
+        return list(range(1, 181, step))[:frame_budget]
+    step = max(1, 180 // frame_budget)
+    return list(range(1, 181, step))[:frame_budget]
+
+
 def process_and_query_seg(
     seg: dict,
     vid: str,
@@ -298,44 +372,104 @@ def process_and_query_seg(
     vision_client_instance: OpenAI,
     base_frame_dir: str | None = None,
     model: str | None = None,
-) -> str:
+    refinement_action: Dict[str, Any] | None = None,
+) -> Tuple[str, Dict[str, Any]]:
     if config is None:
         raise RuntimeError("Config not initialized.")
     base_frame_dir = base_frame_dir or config.base_frame_dir
     model = model or config.vision_model
 
+    decision: Dict[str, Any] = {
+        "policy": "fixed",
+        "clip_ids": [vid],
+        "frame_budget": 15,
+        "direction": "both",
+    }
+    refinement_enabled = use_clip_refiner() and refinement_action
+    if refinement_enabled:
+        decision = apply_refinement_to_decision(
+            decision,
+            vid,
+            base_frame_dir,
+            adjacent_clip_ids,
+            refinement_action,
+        )
+
     messages_content = []
-    frame_nums = list(range(1, 181, 12))
-    log_debug(f"  Selected {len(frame_nums)} frames for vision query: {frame_nums}")
-    for fn in frame_nums:
-        img_path = Path(base_frame_dir, vid, f"{fn:05d}.jpg")
-        if img_path.is_file():
+    selected_frames: Dict[str, List[int]] = {}
+    if not refinement_enabled:
+        frame_nums = list(range(1, 181, 12))
+        selected_frames[vid] = frame_nums
+        log_debug(f"  Selected {len(frame_nums)} frames for vision query: {frame_nums}")
+        for fn in frame_nums:
+            img_path = Path(base_frame_dir, vid, f"{fn:05d}.jpg")
+            if not img_path.is_file():
+                continue
             url = convert_image_to_base64_data_url(str(img_path))
             if url:
                 messages_content.append({"type": "image_url", "image_url": {"url": url}})
 
-    if config.dataset == "tvqa_plus":
-        bbox_info = bbox_to_string_simplified(key=vid)
-        prompt = (
-            f"Images 1-{len(frame_nums)} are video frames extracted from frames 1 to 180. "
-            f"Bounding box information is provided in {bbox_info}. "
-            "You can focus on the key objects and actions within these bounding boxes in the frames.\n"
-            "And here is a description of what I want to know:\n"
-            f"{seg['description']}"
-        )
+        if config.dataset == "tvqa_plus":
+            bbox_info = bbox_to_string_simplified(key=vid)
+            prompt = (
+                f"Images 1-{len(frame_nums)} are video frames extracted from frames 1 to 180. "
+                f"Bounding box information is provided in {bbox_info}. "
+                "You can focus on the key objects and actions within these bounding boxes in the frames.\n"
+                "And here is a description of what I want to know:\n"
+                f"{seg['description']}"
+            )
+        else:
+            prompt = (
+                f"Images 1-{len(frame_nums)} are video frames extracted from frames 1 to 180.\n"
+                "And here is a description of what I want to know:\n"
+                f"{seg['description']}"
+            )
     else:
-        prompt = (
-            f"Images 1-{len(frame_nums)} are video frames extracted from frames 1 to 180.\n"
-            "And here is a description of what I want to know:\n"
-            f"{seg['description']}"
-        )
+        per_clip_budget = max(2, int(decision.get("frame_budget", 15)) // max(len(decision["clip_ids"]), 1))
+        for clip_id in decision["clip_ids"]:
+            frame_nums = sample_fixed_frames(per_clip_budget)
+            selected_frames[clip_id] = frame_nums
+            log_debug(f"  Selected {len(frame_nums)} frames for vision query on {clip_id}: {frame_nums}")
+            messages_content.append(
+                {
+                    "type": "text",
+                    "text": f"Clip {clip_id}; sampled frame ids: {frame_nums}.",
+                }
+            )
+            for fn in frame_nums:
+                img_path = Path(base_frame_dir, clip_id, f"{fn:05d}.jpg")
+                if not img_path.is_file():
+                    continue
+                url = convert_image_to_base64_data_url(str(img_path))
+                if url:
+                    messages_content.append({"type": "image_url", "image_url": {"url": url}})
 
+        if config.dataset == "tvqa_plus":
+            bbox_info = "\n".join(
+                f"Clip {clip_id}:\n{bbox_to_string_simplified(key=clip_id)}"
+                for clip_id in decision["clip_ids"]
+            )
+            prompt = (
+                f"The images above are sampled video frames from {len(decision['clip_ids'])} clip(s). "
+                f"Bounding box information is provided in {bbox_info}. "
+                "You can focus on the key objects and actions within these bounding boxes in the frames.\n"
+                "And here is a description of what I want to know:\n"
+                f"{seg['description']}"
+            )
+        else:
+            prompt = (
+                f"The images above are sampled video frames from {len(decision['clip_ids'])} clip(s).\n"
+                "And here is a description of what I want to know:\n"
+                f"{seg['description']}"
+            )
+
+    decision["selected_frames"] = selected_frames
     messages_content.append({"type": "text", "text": prompt})
     resp = vision_client_instance.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": messages_content}],
     )
-    return resp.choices[0].message.content
+    return resp.choices[0].message.content, decision
 
 
 def parse_action_from_response(response: str) -> Tuple[str, str]:
@@ -363,29 +497,73 @@ def execute_action(
     question_data: Dict,
     episode_sub_block: str,
     clip_subtitles: Dict[str, str],
-) -> Tuple[str, bool]:
+    memory: VideoMemory | None = None,
+    policy_state: Dict[str, Any] | None = None,
+) -> Tuple[str, bool, Dict[str, Any] | None]:
     if action_type == "answer":
-        return f"\n<answer>{content}</answer>", True
+        return f"\n<answer>{content}</answer>", True, None
 
     if action_type == "search":
         try:
             seg = {"description": content}
             information_parts: List[str] = []
+            vision_decision: Dict[str, Any] | None = None
             try:
-                vision_response = process_and_query_seg(seg, vid, text_client, vision_client_instance)
+                refinement_action = None
+                if policy_state is not None:
+                    refinement_action = policy_state.pop("pending_clip_refinement_action", None)
+                vision_response, vision_decision = process_and_query_seg(
+                    seg,
+                    vid,
+                    text_client,
+                    vision_client_instance,
+                    refinement_action=refinement_action,
+                )
                 information_parts.append(f"Visual Description:\n{vision_response.strip()}")
+                if memory is not None:
+                    clip_ids = vision_decision.get("clip_ids", [vid]) if vision_decision else [vid]
+                    selected_frames = (vision_decision or {}).get("selected_frames", {})
+                    for clip_id in clip_ids:
+                        memory.init_clip(clip_id)
+                        memory.update_clip_observation(
+                            clip_id,
+                            {
+                                "search_query": content,
+                                "selected_frames": selected_frames.get(clip_id, []),
+                                "vision_response": vision_response,
+                                "vision_decision": vision_decision,
+                            },
+                            source="visual_query",
+                        )
+                    memory.add_search(
+                        content,
+                        {
+                            "observed_clip": vid,
+                            "selected_frames": selected_frames,
+                            "vision_response": vision_response,
+                            "vision_decision": vision_decision,
+                        },
+                        clip_ids,
+                        source="visual_query",
+                    )
             except Exception as e:
                 log_warn(f"Vision LLM call failed: {e}")
                 information_parts.append(f"Visual Description: Error - {str(e)}")
+                if memory is not None:
+                    memory.mark_failed(vid, reason=f"vision_query_failed: {e}")
 
             combined_info = "\n".join(information_parts)
             if config and config.dataset == "tvqa_plus":
-                bbox_info = bbox_to_string_simplified(key=vid)
-                return f"\n<information>Bounding Box:{bbox_info}\n{combined_info}</information>\n", False
-            return f"\n<information>\n{combined_info}</information>\n", False
+                clip_ids = (vision_decision or {}).get("clip_ids", [vid])
+                bbox_info = "\n".join(
+                    f"Clip {clip_id}:\n{bbox_to_string_simplified(key=clip_id)}"
+                    for clip_id in clip_ids
+                )
+                return f"\n<information>Bounding Box:{bbox_info}\n{combined_info}</information>\n", False, vision_decision
+            return f"\n<information>\n{combined_info}</information>\n", False, vision_decision
         except Exception as e:
             log_warn(f"Search action failed: {e}")
-            return f"\n<information>Error: Failed to get information - {str(e)}</information>\n", False
+            return f"\n<information>Error: Failed to get information - {str(e)}</information>\n", False, None
 
     if action_type == "request_grounding":
         try:
@@ -393,16 +571,30 @@ def execute_action(
             if "error" in grounding_result:
                 log_warn(f"Grounding failed: {grounding_result['error']}")
                 result_content = f"Grounding failed for query: {content}. Error: {grounding_result['error']}"
-                return f"\n<grounding_info>{result_content}</grounding_info>\n", False
+                if memory is not None:
+                    memory.add_grounding(content, vid, grounding_result)
+                    memory.mark_failed(vid, reason=f"grounding_failed: {grounding_result['error']}")
+                return f"\n<grounding_info>{result_content}</grounding_info>\n", False, None
             predicted_clip = grounding_result.get("predicted_clip", vid)
             new_sub = get_clip_subtitle(clip_subtitles, predicted_clip)
+            if memory is not None:
+                memory.add_grounding(content, vid, grounding_result, predicted_clip)
+                memory.update_clip_observation(
+                    predicted_clip,
+                    {"subtitle": new_sub, "grounding_query": content},
+                    source="request_grounding",
+                )
+                memory.mark_useful(predicted_clip, tag="grounding")
             result_content = f"<New_clip>{predicted_clip} + {new_sub}</New_clip>"
-            return f"\n{result_content}\n", False
+            return f"\n{result_content}\n", False, None
         except Exception as e:
             log_warn(f"Grounding action failed: {e}")
-            return f"\n<grounding_info>Error: Failed to perform grounding - {str(e)}</grounding_info>\n", False
+            if memory is not None:
+                memory.add_grounding(content, vid, {"error": str(e)})
+                memory.mark_failed(vid, reason=f"grounding_exception: {e}")
+            return f"\n<grounding_info>Error: Failed to perform grounding - {str(e)}</grounding_info>\n", False, None
 
-    return "\nMy action is not correct. I need to search, request grounding, or answer.\n", False
+    return "\nMy action is not correct. I need to search, request grounding, or answer.\n", False, None
 
 
 def get_clip_subtitle(clip_subtitles: Dict[str, str], clip_name: str) -> str:
@@ -596,6 +788,12 @@ def process_single_question(
     max_turn: int = 5,
 ) -> Dict[str, Any]:
     record = {"vid": vid, "question": question, "turns": [], "final_answer": "", "prompt": prompt}
+    verifier_enabled = use_verifier()
+    memory = VideoMemory() if use_video_memory() or verifier_enabled else None
+    verifier_agent = VerifierAgent() if verifier_enabled else None
+    verifier_retry_count = 0
+    max_verifier_retries = verifier_max_rounds()
+    policy_state: Dict[str, Any] = {}
     conversation_history = prompt
     final_answer = ""
 
@@ -610,7 +808,18 @@ def process_single_question(
                 "provide the final answer in <answer>...</answer> format.\n"
             )
 
-        raw_response = main_llm_generate(conversation_history)
+        llm_input = conversation_history
+        memory_context = ""
+        memory_context_token_estimate = 0
+        if use_video_memory() and memory is not None:
+            memory_context = memory.to_prompt_context(
+                max_items=int(os.getenv("MEMORY_MAX_ITEMS", "8"))
+            )
+            memory_context_token_estimate = estimate_text_tokens(memory_context)
+            if memory_context:
+                llm_input = f"{conversation_history}\n\n{memory_context}\n"
+
+        raw_response = main_llm_generate(llm_input)
         response = postprocess_response(raw_response) if "postprocess_response" in globals() else raw_response
         log_debug(f"LLM Response:\n{response}")
 
@@ -625,9 +834,11 @@ def process_single_question(
             "content": content,
             "is_done": False,
         }
+        if use_video_memory() and memory is not None:
+            turn_record["memory_context_token_estimate"] = memory_context_token_estimate
 
         log_debug(f"Executing action: {action_type}")
-        result_content, is_done = execute_action(
+        result_content, is_done, vision_decision = execute_action(
             action_type,
             content,
             vid,
@@ -636,13 +847,61 @@ def process_single_question(
             question_data=question_data,
             episode_sub_block=episode_sub_block,
             clip_subtitles=clip_subtitles,
+            memory=memory,
+            policy_state=policy_state,
         )
 
         turn_record["result_content"] = result_content
         turn_record["is_done"] = is_done
+        if (
+            use_clip_refiner()
+            and vision_decision is not None
+            and "clip_refinement_action" in vision_decision
+        ):
+            turn_record["vision_decision"] = vision_decision
         log_debug(f"Action result:\n{result_content}")
 
         if is_done and action_type == "answer":
+            if verifier_agent is not None and verifier_retry_count < max_verifier_retries:
+                memory_context_for_verifier = memory.to_prompt_context() if memory is not None else ""
+                recent_evidence = format_recent_evidence(record["turns"])
+                verifier_result = verifier_agent.verify(
+                    main_llm_generate,
+                    question,
+                    format_options(question_data),
+                    content,
+                    memory_context_for_verifier,
+                    recent_evidence,
+                )
+                turn_record["verifier_result"] = verifier_result
+                log_debug(f"Verifier result: {verifier_result}")
+                if verifier_result.get("verdict") == "PASS":
+                    final_answer = content
+                    log_debug(f"Verifier passed answer in turn {turn + 1}: {final_answer}")
+                    record["turns"].append(turn_record)
+                    break
+
+                verifier_retry_count += 1
+                if use_clip_refiner():
+                    refinement_action = plan_clip_refinement(verifier_result, question)
+                    policy_state["pending_clip_refinement_action"] = refinement_action
+                    turn_record["clip_refinement_action"] = refinement_action
+                feedback = build_verifier_feedback(verifier_result)
+                turn_record["result_content"] = feedback
+                turn_record["is_done"] = False
+                if memory is not None:
+                    memory.update_clip_observation(
+                        vid,
+                        {
+                            "candidate_answer": content,
+                            "verifier_feedback": verifier_result,
+                        },
+                        source="verifier",
+                    )
+                conversation_history += feedback
+                record["turns"].append(turn_record)
+                continue
+
             final_answer = content
             log_debug(f"Found answer in turn {turn + 1}: {final_answer}")
             record["turns"].append(turn_record)
@@ -663,6 +922,8 @@ def process_single_question(
 
     record["final_answer"] = final_answer
     record["conversation_history"] = conversation_history
+    if use_video_memory() and memory is not None:
+        record["memory"] = memory.to_json()
     return record
 
 
@@ -766,14 +1027,37 @@ def run_enhanced_pipeline(checkpoint_step: str, max_turn: int = 5, gpu_memory_ut
     detailed_results = []
     for result in results:
         last_response = result["turns"][-1]["response"] if result["turns"] else ""
-        detailed_results.append(
-            {
-                "vid": result["vid"],
-                "question": result["question"],
-                "conversation_history": result["conversation_history"],
-                "last_llm_response": last_response,
-            }
-        )
+        detailed_record = {
+            "vid": result["vid"],
+            "question": result["question"],
+            "final_answer": result.get("final_answer", ""),
+            "gt_answer_idx": result.get("gt_answer_idx"),
+            "conversation_history": result["conversation_history"],
+            "last_llm_response": last_response,
+            "turns": result["turns"],
+        }
+        if use_video_memory() and "memory" in result:
+            detailed_record["memory"] = result["memory"]
+            detailed_record["memory_context_token_estimates"] = [
+                turn.get("memory_context_token_estimate", 0) for turn in result["turns"]
+            ]
+        if use_verifier():
+            verifier_results = [
+                turn["verifier_result"] for turn in result["turns"] if "verifier_result" in turn
+            ]
+            detailed_record["verifier_result"] = verifier_results[-1] if verifier_results else None
+            detailed_record["verifier_results"] = verifier_results
+        if use_clip_refiner():
+            refinement_actions = [
+                turn.get("clip_refinement_action")
+                or turn.get("vision_decision", {}).get("clip_refinement_action")
+                for turn in result["turns"]
+                if turn.get("clip_refinement_action")
+                or turn.get("vision_decision", {}).get("clip_refinement_action")
+            ]
+            detailed_record["clip_refinement_action"] = refinement_actions[-1] if refinement_actions else None
+            detailed_record["clip_refinement_actions"] = refinement_actions
+        detailed_results.append(detailed_record)
 
     total_vision_calls = sum(sum(1 for t in result["turns"] if t["action_type"] == "search") for result in results)
     total_grounding_calls = sum(
