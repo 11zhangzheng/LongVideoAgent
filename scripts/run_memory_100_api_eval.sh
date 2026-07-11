@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run the API baseline on the first N TVQA+ samples.
-# Defaults to N=50 and keeps all memory/verifier/refiner features disabled.
+# Run the API memory-only evaluation on the first N TVQA+ samples.
+# Defaults to N=50, enables VideoMemory, and disables verifier/refiner.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
@@ -14,9 +14,10 @@ fi
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DATA_ROOT="${DATA_ROOT:-/home/zhangzheng/disk1/Tvqa_data}"
-SAMPLE_LIMIT="${SAMPLE_LIMIT:-50}"
+SAMPLE_LIMIT="${SAMPLE_LIMIT:-100}"
+MEMORY_MAX_ITEMS="${MEMORY_MAX_ITEMS:-8}"
 
-QUESTIONS_PATH="${QUESTIONS_PATH:-$DATA_ROOT/LongTVQA_plus_val_normalized.json}"
+QUESTIONS_PATH="${QUESTIONS_PATH:-$DATA_ROOT/results/subsets/tvqa_plus_first${SAMPLE_LIMIT}.json}"
 SUBS_PATH="${SUBS_PATH:-$DATA_ROOT/hf_datasets/LongTVQA_plus/LongTVQA_plus_subtitle_clip_level.json}"
 BASE_FRAME_DIR="${BASE_FRAME_DIR:-$DATA_ROOT/frames/bbt_frames}"
 BBOX_JSON_PATH="${BBOX_JSON_PATH:-$DATA_ROOT/clip_bbox_mapping.json}"
@@ -24,8 +25,8 @@ BBOX_JSON_PATH="${BBOX_JSON_PATH:-$DATA_ROOT/clip_bbox_mapping.json}"
 RESULT_DIR="${RESULT_DIR:-$ROOT_DIR/results}"
 SUBSET_DIR="${SUBSET_DIR:-$RESULT_DIR/subsets}"
 SUBSET_PATH="${SUBSET_PATH:-$SUBSET_DIR/tvqa_plus_first${SAMPLE_LIMIT}.json}"
-OUTPUT_FILENAME="${OUTPUT_FILENAME:-$RESULT_DIR/baseline_${SAMPLE_LIMIT}_summary.json}"
-DETAILED_OUTPUT_FILENAME="${DETAILED_OUTPUT_FILENAME:-$RESULT_DIR/baseline_${SAMPLE_LIMIT}_detail.json}"
+OUTPUT_FILENAME="${OUTPUT_FILENAME:-$RESULT_DIR/memory_${SAMPLE_LIMIT}_summary.json}"
+DETAILED_OUTPUT_FILENAME="${DETAILED_OUTPUT_FILENAME:-$RESULT_DIR/memory_${SAMPLE_LIMIT}_detail.json}"
 
 THREADS="${THREADS:-5}"
 MAX_TURN="${MAX_TURN:-5}"
@@ -84,9 +85,10 @@ print(f"[INFO] Wrote first {min(limit, len(data))} samples to {dst}")
 PY
 
 echo "============================================================"
-echo " LongVideoAgent API Baseline Evaluation"
+echo " LongVideoAgent API Memory-Only Evaluation"
 echo "============================================================"
 echo "SAMPLE_LIMIT:             $SAMPLE_LIMIT"
+echo "MEMORY_MAX_ITEMS:         $MEMORY_MAX_ITEMS"
 echo "QUESTIONS_PATH:           $SUBSET_PATH"
 echo "SUBS_PATH:                $SUBS_PATH"
 echo "BASE_FRAME_DIR:           $BASE_FRAME_DIR"
@@ -97,7 +99,7 @@ echo "THREADS:                  $THREADS"
 echo "MAX_TURN:                 $MAX_TURN"
 echo "============================================================"
 
-USE_VIDEO_MEMORY=0 USE_VERIFIER=0 USE_CLIP_REFINER=0 \
+USE_VIDEO_MEMORY=1 USE_VERIFIER=0 USE_CLIP_REFINER=0 MEMORY_MAX_ITEMS="$MEMORY_MAX_ITEMS" \
 "$PYTHON_BIN" src/evaluation/lvagent/evaluate_api_unified.py \
   --dataset tvqa_plus \
   --checkpoint_step "$CHECKPOINT_STEP" \

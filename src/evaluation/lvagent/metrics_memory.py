@@ -52,7 +52,9 @@ def compute_metrics(detail_data: Any, summary_data: Any = None) -> Dict[str, Any
     summary_by_question = summaries if summaries else [{} for _ in details]
     accuracy_records = summaries if summaries else details
 
-    accuracy = compute_accuracy(accuracy_records)
+    accuracy = summary_accuracy(summary_data)
+    if accuracy is None:
+        accuracy = compute_accuracy(accuracy_records)
     avg_turns = avg(
         [
             len(turns) if turns else int(summary.get("num_turns", 0) or 0)
@@ -116,6 +118,17 @@ def compute_accuracy(summaries: List[Dict[str, Any]]) -> float:
         if final_answer == f"a{gt_answer_idx}".lower():
             correct += 1
     return safe_div(correct, total)
+
+
+def summary_accuracy(summary_data: Any) -> float | None:
+    if not isinstance(summary_data, dict):
+        return None
+    metadata = summary_data.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("accuracy") is not None:
+        return float(metadata["accuracy"])
+    if summary_data.get("accuracy") is not None:
+        return float(summary_data["accuracy"])
+    return None
 
 
 def count_actions(turns: List[Dict[str, Any]], action_type: str) -> int:
